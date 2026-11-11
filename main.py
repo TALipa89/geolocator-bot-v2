@@ -1,17 +1,30 @@
-"""photo-geolocator-01 entry: code-only geolocator (no model calls).
+"""photo-geolocator-01 entry: vision-model geolocator, code fallback.
 
-For each photo it decodes only the DC coefficients of the JPEG (the average
-colour of every 8x8 block, no trained weights, no photo table), averages the
-top rows (sky) and bottom rows (ground) in YCbCr, converts the averages to
-RGB, and maps the colour climate (snow, desert sand, lush tropics, temperate
-greenery, dark boreal forest) to the land centroid of that climate band.
-Every photo is answered, in photo order, in one POST. Deterministic: the
-output is a pure function of the photo bytes.
+Each unanswered photo is shown to a vision model reached through the
+gateway (Anthropic Messages API first, OpenAI Chat Completions as the
+spare vendor). The model answers with clue lines and one JSON verdict
+giving lat, lon and a 0-100 confidence. Answers at or above 55 are
+posted straight away; the ten least confident leftovers get one
+challenge second look that argues against the first estimate. Photos
+the model route cannot place (refusal, empty or unparseable reply,
+spent budget) fall back to the code-only locator kept from v1: decode
+only the DC coefficients of the JPEG, average sky and ground rows in
+YCbCr, and map the colour climate (snow, desert sand, lush tropics,
+temperate greenery, dark boreal forest) to that band's land centroid.
+Every photo ends answered. Requests are a pure function of the photo
+bytes, the fixed prompts and earlier replies, sent strictly in photo
+order, one call at a time, so only one worst-case reservation is ever
+held against the $1.00 trial budget.
 Run: python3 -P -s /bot/main.py  (MAKEFUN_ENV_URL names the env)
 """
+import base64
 import json
 import os
+import re
 import struct
+import sys
+import time
+import urllib.error
 import urllib.request
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -299,18 +312,328 @@ def locate(data):
     return CENTROIDS[band]
 
 
+TOKEN_CAP = 500
+BANK_AT = 55
+CHALLENGE_COUNT = 10
+TRANSIENT = (408, 429, 500, 502, 503, 504, 529)
+MAX_RETRIES = 3
+CALL_TIMEOUT = 120
+
+ANALYST_BRIEF = (
+    "You are a specialist in photo geolocation. Your task is to pin down "
+    "where one street-level photograph was taken. It may come from "
+    "anywhere on Earth and all metadata has been removed. The score for "
+    "each photo is the great-circle distance in kilometres between the "
+    "point you give and the true point, added up across photos, so aim "
+    "for the point that minimises the distance you expect to be out by. "
+    "Work through the evidence in this sequence: first anything readable "
+    "(language, alphabet or script, place names, telephone and web "
+    "formats); then which side of the road traffic uses and what plates "
+    "look like (colours, bands, proportions, vehicle mix); then road "
+    "equipment (centre and edge line colours and patterns, sign shapes "
+    "and colours, chevron boards, distance markers, bollards, delineator "
+    "posts including the colour of their reflectors, barriers, power "
+    "poles and crossarm styles); then plants, soil and rock colour, land "
+    "shape and crops; then buildings (roof forms, wall materials, "
+    "fences); then the sun and shadows to fix the hemisphere and rough "
+    "latitude band; then people, dress, flags and brands. Always commit "
+    "to one best point: never split the difference between two far-apart "
+    "candidates into an ocean or empty midpoint. When you can only place "
+    "the photo inside a country or region, answer where its people and "
+    "roads concentrate (its population-weighted centre) and use the "
+    "vegetation and terrain in shot to position yourself inside it "
+    "rather than defaulting to the capital. Reply with three to six "
+    "short lines naming the decisive clues and the area they point to, "
+    "then a final line holding only a JSON object of the form {\"lat\": "
+    "number, \"lon\": number, \"confidence\": number} with lat in degrees "
+    "north, lon in degrees east and confidence from 0 to 100 meaning "
+    "your honest percentage chance that the truth lies within 200 km "
+    "of the point you gave."
+)
+ASK_FIRST = (
+    "Where was this photograph taken? Follow the required reply shape "
+    "exactly: brief decisive clues first, then the JSON line."
+)
+ASK_CHALLENGE = (
+    "An earlier estimate put this photograph at latitude {lat}, "
+    "longitude {lon} with confidence {conf}. Look again from the start: "
+    "state the strongest clue that tells against that estimate and the "
+    "best rival area, then commit to your final answer in the same shape "
+    "(brief clues, then the JSON line). Keep the earlier point only if "
+    "the evidence really favours it over every rival."
+)
+
+ROUTE = (
+    ("anthropic", "claude-opus-5-5"),
+    ("anthropic", "claude-sonnet-5-5"),
+    ("anthropic", "claude-haiku-5-5"),
+    ("openai", "gpt-6.1-sol"),
+    ("openai", "gpt-6.1-terra"),
+)
+STOP_TYPES = ("budget_exhausted", "request_cap")
+
+
+def pack(obj):
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def vendor_base(vendor):
+    if vendor == "anthropic":
+        return (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/"), os.environ.get("ANTHROPIC_API_KEY") or ""
+    return (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/"), os.environ.get("OPENAI_API_KEY") or ""
+
+
+def make_payload(vendor, model, jpeg, user_text):
+    encoded = base64.b64encode(jpeg).decode("ascii")
+    if vendor == "anthropic":
+        return pack({
+            "model": model,
+            "max_tokens": TOKEN_CAP,
+            "temperature": 0,
+            "system": ANALYST_BRIEF,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": encoded}},
+                {"type": "text", "text": user_text},
+            ]}],
+        })
+    return pack({
+        "model": model,
+        "max_completion_tokens": TOKEN_CAP,
+        "messages": [
+            {"role": "system", "content": ANALYST_BRIEF},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}},
+                {"type": "text", "text": user_text},
+            ]},
+        ],
+    })
+
+
+def reported_error(raw):
+    try:
+        node = json.loads(raw.decode("utf-8", errors="replace")).get("error")
+    except ValueError:
+        return None
+    if isinstance(node, dict):
+        for field in ("type", "code"):
+            val = node.get(field)
+            if isinstance(val, str):
+                return val
+    return None
+
+
+def reply_text(vendor, raw):
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return ""
+    if vendor == "anthropic":
+        return "\n".join(str(b.get("text") or "") for b in doc.get("content") or [] if isinstance(b, dict) and b.get("type") == "text")
+    try:
+        content = doc["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return ""
+
+
+class Gateway:
+    def __init__(self):
+        self.pos = 0
+        self.spent = False
+
+    def ask(self, jpeg, user_text):
+        while not self.spent and self.pos < len(ROUTE):
+            vendor, model = ROUTE[self.pos]
+            outcome, text = self._try(vendor, model, jpeg, user_text)
+            if outcome == "next":
+                self.pos += 1
+                continue
+            if outcome == "stop":
+                self.spent = True
+                return "budget", ""
+            return outcome, text
+        return ("budget", "") if self.spent else ("failed", "")
+
+    def _try(self, vendor, model, jpeg, user_text):
+        base, key = vendor_base(vendor)
+        if vendor == "anthropic":
+            url = base + "/v1/messages"
+            headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+            if key:
+                headers["x-api-key"] = key
+        else:
+            url = base + "/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = "Bearer " + key
+        body = make_payload(vendor, model, jpeg, user_text)
+        for attempt in range(MAX_RETRIES + 1):
+            req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+            try:
+                with OPENER.open(req, timeout=CALL_TIMEOUT) as res:
+                    status, raw, hint = res.status, res.read(), None
+            except urllib.error.HTTPError as err:
+                try:
+                    status, raw = err.code, err.read()
+                    hint = err.headers.get("x-should-retry")
+                finally:
+                    err.close()
+            except (urllib.error.URLError, OSError):
+                return "failed", ""
+            if 200 <= status < 300:
+                return "ok", reply_text(vendor, raw)
+            kind = reported_error(raw)
+            if kind in STOP_TYPES:
+                return "stop", ""
+            if status == 401 or kind == "model_not_allowed":
+                return "next", ""
+            if status in TRANSIENT and hint != "false" and attempt < MAX_RETRIES:
+                time.sleep(2 * (attempt + 1))
+                continue
+            sys.stderr.write("geo: %s/%s HTTP %s %s: %r\n" % (vendor, model, status, kind or "", raw[:200]))
+            return "failed", ""
+        return "failed", ""
+
+
+BRACED = re.compile(r"\{[^{}]*\}")
+PLAIN_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def lat_ok(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and -90 <= v <= 90
+
+
+def lon_ok(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and -180 <= v <= 180
+
+
+def read_verdict(text):
+    if not text:
+        return None
+    chosen = None
+    for match in BRACED.finditer(text):
+        try:
+            obj = json.loads(match.group(0))
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        lat = obj.get("lat", obj.get("latitude"))
+        lon = obj.get("lon", obj.get("lng", obj.get("longitude")))
+        if lat_ok(lat) and lon_ok(lon):
+            pass
+        elif lat_ok(lon) and lon_ok(lat):
+            lat, lon = lon, lat
+        else:
+            continue
+        conf = obj.get("confidence", 0)
+        if isinstance(conf, bool) or not isinstance(conf, (int, float)):
+            conf = 0
+        conf = float(conf)
+        if 0 < conf <= 1:
+            conf = conf * 100.0
+        chosen = (float(lat), float(lon), max(0.0, min(100.0, conf)))
+    if chosen is not None:
+        return chosen
+    nums = [float(m.group(0)) for m in PLAIN_NUM.finditer(text)]
+    i = len(nums) - 2
+    while i >= 0:
+        if lat_ok(nums[i]) and lon_ok(nums[i + 1]):
+            return (nums[i], nums[i + 1], 0.0)
+        i -= 1
+    return None
+
+
+def send_once(env_url, batch):
+    req = urllib.request.Request(env_url + "/answers", data=pack({"answers": batch}), method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with OPENER.open(req, timeout=120) as res:
+            status, raw = res.status, res.read()
+    except urllib.error.HTTPError as err:
+        try:
+            status, raw = err.code, err.read()
+        finally:
+            err.close()
+    except (urllib.error.URLError, OSError):
+        return 0, None
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return status, None
+
+
+def deliver(env_url, batch):
+    if not batch:
+        return set()
+    status, body = send_once(env_url, batch)
+    if status == 200 and isinstance(body, dict):
+        return set(body.get("accepted") or [a["id"] for a in batch])
+    done = set()
+    for item in batch:
+        st, _ignored = send_once(env_url, [item])
+        if st in (200, 409):
+            done.add(item["id"])
+    return done
+
+
+def entry(photo_id, lat, lon):
+    return {"id": photo_id, "lat": round(float(lat), 6), "lon": round(float(lon), 6)}
+
+
 def main():
     env_url = os.environ["MAKEFUN_ENV_URL"].rstrip("/")
     listing = http_json(env_url + "/photos")
-    answers = []
-    for photo in listing["photos"]:
-        if photo.get("answered"):
+    queue = [p for p in listing["photos"] if not p.get("answered")]
+    blobs = {}
+    for photo in queue:
+        blobs[photo["id"]] = http_bytes(env_url + photo.get("url", "/photos/" + photo["id"] + ".jpg"))
+    order = {}
+    for idx, photo in enumerate(queue):
+        order[photo["id"]] = idx
+    verdicts = {}
+    settled = set()
+    try:
+        gate = Gateway()
+        for photo in queue:
+            state, text = gate.ask(blobs[photo["id"]], ASK_FIRST)
+            verdicts[photo["id"]] = read_verdict(text) if state == "ok" else None
+        sure = [entry(p["id"], verdicts[p["id"]][0], verdicts[p["id"]][1]) for p in queue if verdicts[p["id"]] and verdicts[p["id"]][2] >= BANK_AT]
+        settled = deliver(env_url, sure)
+        pending = [p for p in queue if p["id"] not in settled]
+
+        def rank(p):
+            v = verdicts[p["id"]]
+            return (v[2] if v else -1.0, order[p["id"]])
+
+        pending.sort(key=rank)
+        for photo in pending[:CHALLENGE_COUNT]:
+            before = verdicts[photo["id"]]
+            if before is None:
+                prompt = ASK_FIRST
+            else:
+                prompt = ASK_CHALLENGE.format(lat="%.4f" % before[0], lon="%.4f" % before[1], conf="%.0f" % before[2])
+            state, text = gate.ask(blobs[photo["id"]], prompt)
+            after = read_verdict(text) if state == "ok" else None
+            if after is not None and (before is None or after[2] >= before[2]):
+                verdicts[photo["id"]] = after
+    except Exception as exc:
+        sys.stderr.write("geo: model phase cut short: %r\n" % (exc,))
+    rest = []
+    for photo in queue:
+        if photo["id"] in settled:
             continue
-        jpeg = http_bytes(env_url + photo.get("url", "/photos/" + photo["id"] + ".jpg"))
-        lat, lon = locate(jpeg)
-        answers.append({"id": photo["id"], "lat": round(lat, 6), "lon": round(lon, 6)})
-    if answers:
-        http_json(env_url + "/answers", {"answers": answers})
+        v = verdicts.get(photo["id"])
+        lat, lon = (v[0], v[1]) if v else locate(blobs[photo["id"]])
+        rest.append(entry(photo["id"], lat, lon))
+    settled |= deliver(env_url, rest)
+    for photo in queue:
+        if photo["id"] not in settled:
+            lat, lon = locate(blobs[photo["id"]])
+            settled |= deliver(env_url, [entry(photo["id"], lat, lon)])
 
 
 if __name__ == "__main__":
